@@ -1690,16 +1690,23 @@ class GetLinkStatsCommand : public WifiCommand {
                 ALOGV("LLS %s: %d: current_peer_info(%p)->num_rate=%" PRIu32, __FUNCTION__,
                       __LINE__, current_peer_info, current_peer_info->num_rate);
                 // trailing wifi_rate_stat(s)
-                int expected_size = offsetof(wifi_peer_info, rate_stats) +
-                                    current_peer_info->num_rate * sizeof(wifi_rate_stat);
-                if (confirmed_size + expected_size > len) {
-                    ALOGE("LLS %s: %d: [FAILED] check trailing wifi_rate_stat(s), "
-                          "confirmed_size=%" PRIu32 ", expected_size=%d, len=%d",
-                          __FUNCTION__, __LINE__, confirmed_size, expected_size, len);
-                    return false;
+                // Cap num_rate against available buffer to survive driver corruption
+                uint32_t num_rate = current_peer_info->num_rate;
+                uint32_t rate_offset = offsetof(wifi_peer_info, rate_stats);
+                uint32_t max_possible_rate = (len >= (int)(confirmed_size + rate_offset))
+                        ? (uint32_t)(len - confirmed_size - rate_offset) / sizeof(wifi_rate_stat)
+                        : 0;
+                if (num_rate > max_possible_rate) {
+                    ALOGW("LLS %s: %d: num_rate=%" PRIu32 " capped to %" PRIu32
+                          " (confirmed=%" PRIu32 ", len=%d)",
+                          __FUNCTION__, __LINE__, num_rate, max_possible_rate,
+                          confirmed_size, len);
+                    num_rate = max_possible_rate;
                 }
+                uint32_t expected_size = rate_offset + num_rate * sizeof(wifi_rate_stat);
                 confirmed_size += expected_size;
                 current_peer_info = (wifi_peer_info*)(((u8*)current_peer_info) + expected_size);
+
             }
 
             current_link_stat = (wifi_link_stat*)(((u8*)data) + confirmed_size);
