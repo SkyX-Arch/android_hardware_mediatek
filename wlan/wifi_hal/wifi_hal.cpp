@@ -1663,8 +1663,27 @@ class GetLinkStatsCommand : public WifiCommand {
         wifi_iface_ml_stat* ml_stat = (wifi_iface_ml_stat*)data;
         uint32_t confirmed_size = offsetof(wifi_iface_ml_stat, links);
         if (ml_stat->num_links <= 0) {
-            ALOGE("LLS %s: %d No links found", __FUNCTION__, __LINE__);
-            return false;
+            // [LLS spam fix] num_links=0 is the *expected* state when the
+            // STA is not associated (info.state < WIFI_ASSOCIATED). The
+            // previous unconditional ALOGE produced ~3 s cadence logcat
+            // spam whenever wifi was idle / disconnected. Demote to
+            // VERBOSE in the expected case and return true so the caller's
+            // "LLS RSP: invalid vendor data length" ALOGE doesn't double-
+            // fire for legitimate disconnected-state responses; the
+            // upstream handler then receives num_links=0 + num_radios=0,
+            // which is exactly what AOSP frameworks expect for an idle
+            // STA. Keep ERROR + return false only when the driver claims
+            // STA-associated (info.state >= WIFI_ASSOCIATED) but emits
+            // zero links -- that combination is a genuine driver / firmware
+            // bug and must remain visible.
+            if (ml_stat->info.state >= WIFI_ASSOCIATED) {
+                ALOGE("LLS %s: %d No links found (state=%d, unexpected)",
+                      __FUNCTION__, __LINE__, ml_stat->info.state);
+                return false;
+            }
+            ALOGV("LLS %s: %d No links found (state=%d, expected)",
+                  __FUNCTION__, __LINE__, ml_stat->info.state);
+            return true;
         }
 
         // trailing wifi_link_stat(s)
