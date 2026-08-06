@@ -16,9 +16,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cstddef>
+#include <fstream>
 
 #include <linux/pkt_sched.h>
 #include <netlink/attr.h>
@@ -1626,25 +1628,108 @@ class GetLinkStatsCommand : public WifiCommand {
         void* data = reply.get_vendor_data();
         int len = reply.get_vendor_data_len();
 
-        ALOGI("LLS RSP: data=%p, len=%d", data, len);
+        ALOGV("LLS RSP: data=%p, len=%d", data, len);
 
-        // [wifi_iface_ml_stat][num_radios][wifi_radio_stat list][tx_time_per_levels list]
-        wifi_iface_ml_stat* ml_stat_ptr = (wifi_iface_ml_stat*)data;
         uint32_t num_radios = 0;
         wifi_radio_stat* radio_stats_ptr = nullptr;
 
-        // Quick sanity check and patch dangling pointers
+        // The MTK firmware shipped with pre-U devices returns the legacy
+        // wifi_iface_stat wire layout. Android U QPR2 introduced the MLO
+        // header, but the vendor response does not identify its layout;
+        // selecting the ABI at compile time is therefore required.
+#ifdef USE_PRE_U_QPR2_STRUCT
+        wifi_iface_stat* iface_stat_ptr = (wifi_iface_stat*)data;
+#else
+        wifi_iface_ml_stat* ml_stat_ptr = (wifi_iface_ml_stat*)data;
+#endif
+
+        // Validate the variable-length vendor payload before exposing any
+        // pointers into it to the framework. Some MTK firmware revisions
+        // return a different LLS wire layout; treating that payload as the
+        // selected ABI would otherwise make the framework see WIFI_ERROR_UNKNOWN
+        // (and, worse, could expose out-of-bounds pointers).
         if (!check_data_sanity(data, len, num_radios, radio_stats_ptr)) {
-            ALOGE("LLS RSP: invalid vendor data length");
-            return NL_SKIP;
+            // Link-layer stats are polled periodically. Keep one actionable
+            // diagnostic per HAL process without recreating the old log spam.
+            static std::atomic_bool malformed_payload_logged{false};
+            bool expected = false;
+            if (malformed_payload_logged.compare_exchange_strong(expected, true)) {
+                ALOGW("LLS RSP: discarded unsupported or malformed vendor payload "
+                      "(len=%d); reporting empty link-layer stats", len);
+            } else {
+                ALOGV("LLS RSP: discarded unsupported or malformed vendor payload "
+                      "(len=%d); reporting empty link-layer stats", len);
+            }
+
+#ifdef USE_PRE_U_QPR2_STRUCT
+            if (mHandler.on_link_stats_results != nullptr) {
+                // The callback consumes the structure synchronously. Do not
+                // pass the malformed netlink buffer and do not retain this
+                // stack address in the callback. The vendor payload is not
+                // trusted, but the kernel interface counters are independent
+                // of the MTK LLS wire layout and provide useful base stats.
+                wifi_iface_stat fallback_iface_stat = {};
+                fallback_iface_stat.iface = ifaceHandle();
+                populateFallbackIfaceStats(fallback_iface_stat);
+                (*mHandler.on_link_stats_results)(id, &fallback_iface_stat, 0, nullptr);
+            }
+#else
+            if (mHandler.on_multi_link_stats_results != nullptr) {
+                wifi_iface_ml_stat empty_iface_ml_stat = {};
+                (*mHandler.on_multi_link_stats_results)(id, &empty_iface_ml_stat, 0, nullptr);
+            }
+#endif
+            return NL_OK;
         }
 
+#ifdef USE_PRE_U_QPR2_STRUCT
+        if (mHandler.on_link_stats_results == nullptr) {
+            ALOGE("LLS RSP: legacy callback is unavailable");
+            return NL_SKIP;
+        }
+#else
+        if (mHandler.on_multi_link_stats_results == nullptr) {
+            ALOGE("LLS RSP: MLO callback is unavailable");
+            return NL_SKIP;
+        }
+#endif
+
+#ifdef USE_PRE_U_QPR2_STRUCT
+        (*mHandler.on_link_stats_results)(id, iface_stat_ptr, num_radios, radio_stats_ptr);
+#else
         (*mHandler.on_multi_link_stats_results)(id, ml_stat_ptr, num_radios, radio_stats_ptr);
+#endif
 
         return NL_OK;
     }
 
   private:
+#ifdef USE_PRE_U_QPR2_STRUCT
+    static uint32_t readInterfaceCounter(const char* interface_name, const char* counter_name) {
+        const std::string path = std::string("/sys/class/net/") + interface_name +
+                "/statistics/" + counter_name;
+        std::ifstream file(path);
+        uint64_t value = 0;
+        if (!(file >> value)) {
+            return 0;
+        }
+        return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value);
+    }
+
+    void populateFallbackIfaceStats(wifi_iface_stat& iface_stat) const {
+        if (mIfaceInfo == nullptr) {
+            return;
+        }
+        // These are standard kernel counters, not a reinterpretation of the
+        // incompatible MTK vendor payload. Keep them in the best-effort
+        // BE bucket and leave radio/peer/RSSI fields zero.
+        iface_stat.ac[WIFI_AC_BE].tx_mpdu =
+                readInterfaceCounter(mIfaceInfo->name, "tx_packets");
+        iface_stat.ac[WIFI_AC_BE].rx_mpdu =
+                readInterfaceCounter(mIfaceInfo->name, "rx_packets");
+    }
+#endif
+
     /**
      * Check data sizes to avoid memory access violation quickly.
      * We can safely convert data to upper level representation
@@ -1652,121 +1737,181 @@ class GetLinkStatsCommand : public WifiCommand {
      */
     bool check_data_sanity(void* data, int len, uint32_t& num_radios,
                            wifi_radio_stat*& radio_stats_ptr) {
-        if (data == nullptr || len < offsetof(wifi_iface_ml_stat, links)) {
-            ALOGE("LLS %s: %d", __FUNCTION__, __LINE__);
+        if (data == nullptr || len < 0) {
+            ALOGV("LLS %s: %d", __FUNCTION__, __LINE__);
             return false;
         }
 
         ALOGV("LLS %s: %d: data=%p, len=%d", __FUNCTION__, __LINE__, data, len);
 
-        // wifi_iface_ml_stat header
-        wifi_iface_ml_stat* ml_stat = (wifi_iface_ml_stat*)data;
-        uint32_t confirmed_size = offsetof(wifi_iface_ml_stat, links);
-        if (ml_stat->num_links <= 0) {
-            // [LLS spam fix] num_links=0 is the *expected* state when the
-            // STA is not associated (info.state < WIFI_ASSOCIATED). The
-            // previous unconditional ALOGE produced ~3 s cadence logcat
-            // spam whenever wifi was idle / disconnected. Demote to
-            // VERBOSE in the expected case and return true so the caller's
-            // "LLS RSP: invalid vendor data length" ALOGE doesn't double-
-            // fire for legitimate disconnected-state responses; the
-            // upstream handler then receives num_links=0 + num_radios=0,
-            // which is exactly what AOSP frameworks expect for an idle
-            // STA. Keep ERROR + return false only when the driver claims
-            // STA-associated (info.state >= WIFI_ASSOCIATED) but emits
-            // zero links -- that combination is a genuine driver / firmware
-            // bug and must remain visible.
-            if (ml_stat->info.state >= WIFI_ASSOCIATED) {
-                ALOGE("LLS %s: %d No links found (state=%d, unexpected)",
-                      __FUNCTION__, __LINE__, ml_stat->info.state);
-                return false;
-            }
-            ALOGV("LLS %s: %d No links found (state=%d, expected)",
-                  __FUNCTION__, __LINE__, ml_stat->info.state);
-            return true;
-        }
+        static constexpr uint32_t kMaxLlsPeers = 64;
+        static constexpr uint32_t kMaxLlsLinks = 16;
+        static constexpr uint32_t kMaxLlsRadios = 8;
+        static constexpr uint32_t kMaxLlsChannelsPerRadio = 256;
+        static constexpr uint32_t kMaxLlsTxLevelsPerRadio = 256;
 
-        // trailing wifi_link_stat(s)
-        wifi_link_stat* current_link_stat = ml_stat->links;
-        ALOGV("LLS %s: %d: ml_stat->num_links=%d", __FUNCTION__, __LINE__, ml_stat->num_links);
-        for (int i = 0; i < ml_stat->num_links; ++i) {
-            // wifi_link_stat header
-            if (confirmed_size + offsetof(wifi_link_stat, peer_info) > len) {
-                ALOGE("LLS %s: %d", __FUNCTION__, __LINE__);
-                return false;
-            }
-            confirmed_size += offsetof(wifi_link_stat, peer_info);
-            // trailing wifi_peer_info(s)
-            wifi_peer_info* current_peer_info = current_link_stat->peer_info;
-            ALOGV("LLS %s: %d: current_link_stat(%p)->num_peers=%" PRIu32, __FUNCTION__, __LINE__,
-                  current_link_stat, current_link_stat->num_peers);
-            for (int j = 0; j < current_link_stat->num_peers; ++j) {
-                // wifi_peer_info header
-                if (confirmed_size + offsetof(wifi_peer_info, rate_stats) > len) {
-                    ALOGE("LLS %s: %d", __FUNCTION__, __LINE__);
-                    return false;
-                }
-                ALOGV("LLS %s: %d: current_peer_info(%p)->num_rate=%" PRIu32, __FUNCTION__,
-                      __LINE__, current_peer_info, current_peer_info->num_rate);
-                // trailing wifi_rate_stat(s)
-                // Cap num_rate against available buffer to survive driver corruption
-                uint32_t num_rate = current_peer_info->num_rate;
-                uint32_t rate_offset = offsetof(wifi_peer_info, rate_stats);
-                uint32_t max_possible_rate = (len >= (int)(confirmed_size + rate_offset))
-                        ? (uint32_t)(len - confirmed_size - rate_offset) / sizeof(wifi_rate_stat)
-                        : 0;
-                if (num_rate > max_possible_rate) {
-                    ALOGW("LLS %s: %d: num_rate=%" PRIu32 " capped to %" PRIu32
-                          " (confirmed=%" PRIu32 ", len=%d)",
-                          __FUNCTION__, __LINE__, num_rate, max_possible_rate,
-                          confirmed_size, len);
-                    num_rate = max_possible_rate;
-                }
-                uint32_t expected_size = rate_offset + num_rate * sizeof(wifi_rate_stat);
-                confirmed_size += expected_size;
-                current_peer_info = (wifi_peer_info*)(((u8*)current_peer_info) + expected_size);
-
-            }
-
-            current_link_stat = (wifi_link_stat*)(((u8*)data) + confirmed_size);
-        }
-
-        // num_radios
-        if (confirmed_size + sizeof(uint32_t) > len) {
-            ALOGE("LLS %s: %d", __FUNCTION__, __LINE__);
+#ifdef USE_PRE_U_QPR2_STRUCT
+        // Legacy pre-U QPR2 payload:
+        // [wifi_iface_stat][wifi_peer_info...][num_radios]...
+        if (static_cast<size_t>(len) < offsetof(wifi_iface_stat, peer_info)) {
+            ALOGV("LLS %s: legacy interface header is truncated", __FUNCTION__);
             return false;
         }
-        uint32_t* num_radios_ptr = (uint32_t*)(((u8*)ml_stat) + confirmed_size);
+        wifi_iface_stat* iface_stat = (wifi_iface_stat*)data;
+        size_t confirmed_size = offsetof(wifi_iface_stat, peer_info);
+        if (iface_stat->num_peers > kMaxLlsPeers) {
+            ALOGV("LLS %s: invalid legacy num_peers=%" PRIu32, __FUNCTION__,
+                  iface_stat->num_peers);
+            return false;
+        }
+        wifi_peer_info* current_peer_info = iface_stat->peer_info;
+        ALOGV("LLS %s: legacy num_peers=%" PRIu32, __FUNCTION__, iface_stat->num_peers);
+        for (uint32_t i = 0; i < iface_stat->num_peers; ++i) {
+            const size_t peer_header_size = offsetof(wifi_peer_info, rate_stats);
+            if (confirmed_size > static_cast<size_t>(len) ||
+                peer_header_size > static_cast<size_t>(len) - confirmed_size) {
+                return false;
+            }
+            const uint32_t num_rate = current_peer_info->num_rate;
+            const size_t rate_offset = offsetof(wifi_peer_info, rate_stats);
+            const size_t max_possible_rate =
+                    (rate_offset <= static_cast<size_t>(len) - confirmed_size)
+                    ? (static_cast<size_t>(len) - confirmed_size - rate_offset) /
+                              sizeof(wifi_rate_stat)
+                    : 0;
+            if (static_cast<size_t>(num_rate) > max_possible_rate) {
+                ALOGV("LLS %s: invalid legacy num_rate=%" PRIu32
+                      ", max_possible=%zu (confirmed=%zu, len=%d)",
+                      __FUNCTION__, num_rate, max_possible_rate, confirmed_size, len);
+                return false;
+            }
+            const size_t expected_size =
+                    rate_offset + static_cast<size_t>(num_rate) * sizeof(wifi_rate_stat);
+            if (expected_size > static_cast<size_t>(len) - confirmed_size) return false;
+            confirmed_size += expected_size;
+            current_peer_info = (wifi_peer_info*)(((u8*)current_peer_info) + expected_size);
+        }
+#else
+        // Current U/QPR2+ payload:
+        // [wifi_iface_ml_stat][wifi_link_stat...][num_radios]...
+        if (static_cast<size_t>(len) < offsetof(wifi_iface_ml_stat, links)) {
+            ALOGV("LLS %s: MLO interface header is truncated", __FUNCTION__);
+            return false;
+        }
+        wifi_iface_ml_stat* ml_stat = (wifi_iface_ml_stat*)data;
+        size_t confirmed_size = offsetof(wifi_iface_ml_stat, links);
+        if (ml_stat->num_links < 0 ||
+            static_cast<uint32_t>(ml_stat->num_links) > kMaxLlsLinks) {
+            ALOGV("LLS %s: invalid num_links=%d", __FUNCTION__, ml_stat->num_links);
+            return false;
+        }
+        wifi_link_stat* current_link_stat = ml_stat->links;
+        for (int i = 0; i < ml_stat->num_links; ++i) {
+            const size_t link_header_size = offsetof(wifi_link_stat, peer_info);
+            if (confirmed_size > static_cast<size_t>(len) ||
+                link_header_size > static_cast<size_t>(len) - confirmed_size) {
+                return false;
+            }
+            confirmed_size += link_header_size;
+            wifi_peer_info* current_peer_info = current_link_stat->peer_info;
+            if (current_link_stat->num_peers > kMaxLlsPeers) {
+                ALOGV("LLS %s: invalid num_peers=%" PRIu32, __FUNCTION__,
+                      current_link_stat->num_peers);
+                return false;
+            }
+            for (uint32_t j = 0; j < current_link_stat->num_peers; ++j) {
+                const size_t peer_header_size = offsetof(wifi_peer_info, rate_stats);
+                if (confirmed_size > static_cast<size_t>(len) ||
+                    peer_header_size > static_cast<size_t>(len) - confirmed_size) {
+                    return false;
+                }
+                const uint32_t num_rate = current_peer_info->num_rate;
+                const size_t rate_offset = offsetof(wifi_peer_info, rate_stats);
+                const size_t max_possible_rate =
+                        (rate_offset <= static_cast<size_t>(len) - confirmed_size)
+                        ? (static_cast<size_t>(len) - confirmed_size - rate_offset) /
+                                  sizeof(wifi_rate_stat)
+                        : 0;
+                if (static_cast<size_t>(num_rate) > max_possible_rate) {
+                    ALOGV("LLS %s: invalid num_rate=%" PRIu32
+                          ", max_possible=%zu (confirmed=%zu, len=%d)",
+                          __FUNCTION__, num_rate, max_possible_rate, confirmed_size, len);
+                    return false;
+                }
+                const size_t expected_size =
+                        rate_offset + static_cast<size_t>(num_rate) * sizeof(wifi_rate_stat);
+                if (expected_size > static_cast<size_t>(len) - confirmed_size) return false;
+                confirmed_size += expected_size;
+                current_peer_info = (wifi_peer_info*)(((u8*)current_peer_info) + expected_size);
+            }
+            current_link_stat = (wifi_link_stat*)(((u8*)data) + confirmed_size);
+        }
+#endif
+
+        // num_radios
+        if (confirmed_size > static_cast<size_t>(len) ||
+            sizeof(uint32_t) > static_cast<size_t>(len) - confirmed_size) {
+            ALOGV("LLS %s: %d", __FUNCTION__, __LINE__);
+            return false;
+        }
+        uint32_t* num_radios_ptr = (uint32_t*)(((u8*)data) + confirmed_size);
         ALOGV("LLS %s: num_radios_ptr=%p", __FUNCTION__, num_radios_ptr);
         num_radios = *num_radios_ptr;
         ALOGV("LLS %s: num_radios=%" PRIu32, __FUNCTION__, num_radios);
+        if (num_radios > kMaxLlsRadios) {
+            ALOGV("LLS %s: %d invalid num_radios=%" PRIu32,
+                  __FUNCTION__, __LINE__, num_radios);
+            return false;
+        }
         confirmed_size += sizeof(uint32_t);
 
+        // A disconnected interface may legitimately report no radios. Keep
+        // the result valid and let the upper layer consume an empty stats
+        // response instead of converting normal idle state into ERROR_UNKNOWN.
+        if (num_radios == 0) {
+            radio_stats_ptr = nullptr;
+            return true;
+        }
+
         // wifi_radio_stat(s)
-        wifi_radio_stat* current_radio_stat = (wifi_radio_stat*)(((u8*)ml_stat) + confirmed_size);
+        wifi_radio_stat* current_radio_stat = (wifi_radio_stat*)(((u8*)data) + confirmed_size);
         radio_stats_ptr = current_radio_stat;
         uint32_t*** tx_time_per_levels_pointer_list = new uint32_t**[num_radios];
         uint32_t* tx_levels_offsets = new uint32_t[num_radios];
         uint32_t total_num_tx_levels = 0;
         for (int i = 0; i < num_radios; ++i) {
-            if (confirmed_size + offsetof(wifi_radio_stat, channels) > len) {
+            const size_t radio_header_size = offsetof(wifi_radio_stat, channels);
+            if (confirmed_size > static_cast<size_t>(len) ||
+                radio_header_size > static_cast<size_t>(len) - confirmed_size) {
                 delete[] tx_time_per_levels_pointer_list;
                 delete[] tx_levels_offsets;
-                ALOGE("LLS %s: %d: [FAILED] check wifi_radio_stat(s), confirmed_size=%" PRIu32
+                ALOGV("LLS %s: %d: [FAILED] check wifi_radio_stat(s), confirmed_size=%zu"
                       ", offsetof(wifi_radio_stat, channels)=%zu, len=%d",
-                      __FUNCTION__, __LINE__, confirmed_size, offsetof(wifi_radio_stat, channels),
-                      len);
+                      __FUNCTION__, __LINE__, confirmed_size, radio_header_size, len);
                 return false;
             }
-            ALOGI("LLS %s: %d: current_radio_stat->num_channels=%" PRIu32, __FUNCTION__, __LINE__,
+            ALOGV("LLS %s: %d: current_radio_stat->num_channels=%" PRIu32, __FUNCTION__, __LINE__,
                   current_radio_stat->num_channels);
-            int expected_size = offsetof(wifi_radio_stat, channels) +
-                                current_radio_stat->num_channels * sizeof(wifi_channel_stat);
-            if (confirmed_size + expected_size > len) {
+            if (current_radio_stat->num_channels > kMaxLlsChannelsPerRadio ||
+                current_radio_stat->num_tx_levels > kMaxLlsTxLevelsPerRadio ||
+                total_num_tx_levels > kMaxLlsTxLevelsPerRadio -
+                        current_radio_stat->num_tx_levels) {
+                ALOGV("LLS %s: %d invalid radio counts: channels=%" PRIu32
+                      ", tx_levels=%" PRIu32 ", total_tx_levels=%" PRIu32,
+                      __FUNCTION__, __LINE__, current_radio_stat->num_channels,
+                      current_radio_stat->num_tx_levels, total_num_tx_levels);
                 delete[] tx_time_per_levels_pointer_list;
                 delete[] tx_levels_offsets;
-                ALOGE("LLS %s: %d: [FAILED] check wifi_channel_stat(s), confirmed_size=%" PRIu32
-                      ", expected_size=%d, sizeof(wifi_channel_stat)=%zu, len=%d",
+                return false;
+            }
+            const size_t expected_size = radio_header_size +
+                    static_cast<size_t>(current_radio_stat->num_channels) *
+                            sizeof(wifi_channel_stat);
+            if (expected_size > static_cast<size_t>(len) - confirmed_size) {
+                delete[] tx_time_per_levels_pointer_list;
+                delete[] tx_levels_offsets;
+                ALOGV("LLS %s: %d: [FAILED] check wifi_channel_stat(s), confirmed_size=%zu"
+                      ", expected_size=%zu, sizeof(wifi_channel_stat)=%zu, len=%d",
                       __FUNCTION__, __LINE__, confirmed_size, expected_size,
                       sizeof(wifi_channel_stat), len);
                 return false;
@@ -1780,7 +1925,10 @@ class GetLinkStatsCommand : public WifiCommand {
 
         uint32_t* tx_levels = (uint32_t*)current_radio_stat;
 
-        if (confirmed_size + total_num_tx_levels * sizeof(uint32_t) > len) {
+        const size_t tx_levels_size =
+                static_cast<size_t>(total_num_tx_levels) * sizeof(uint32_t);
+        if (confirmed_size > static_cast<size_t>(len) ||
+            tx_levels_size > static_cast<size_t>(len) - confirmed_size) {
             delete[] tx_time_per_levels_pointer_list;
             delete[] tx_levels_offsets;
             ALOGE("LLS %s: %d", __FUNCTION__, __LINE__);
@@ -1794,8 +1942,8 @@ class GetLinkStatsCommand : public WifiCommand {
         delete[] tx_time_per_levels_pointer_list;
         delete[] tx_levels_offsets;
 
-        confirmed_size += total_num_tx_levels * sizeof(uint32_t);
-        ALOGI("LLS %s: confirmed_size=%d, len=%d", __FUNCTION__, (int)confirmed_size, len);
+        confirmed_size += tx_levels_size;
+        ALOGV("LLS %s: confirmed_size=%zu, len=%d", __FUNCTION__, confirmed_size, len);
 
         return true;
     }

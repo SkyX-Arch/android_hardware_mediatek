@@ -6,8 +6,32 @@
 soong_namespace {
 }
 
+soong_config_module_type {
+    name: "mediatek_wifi_hal_defaults",
+    module_type: "cc_defaults",
+    config_namespace: "mediatek_wifi_hal",
+    bool_variables: [
+        "use_pre_u_qpr2_struct",
+    ],
+    properties: [
+        "cflags",
+    ],
+}
+
+mediatek_wifi_hal_defaults {
+    name: "mediatek_wifi_hal_defaults",
+    soong_config_variables: {
+        use_pre_u_qpr2_struct: {
+            cflags: [
+                "-DUSE_PRE_U_QPR2_STRUCT",
+            ],
+        },
+    },
+}
+
 cc_library {
     name: "libwifi-hal-mediatek",
+    defaults: ["mediatek_wifi_hal_defaults"],
     vendor: true,
     cflags: [
         "-Wno-unused-parameter",
