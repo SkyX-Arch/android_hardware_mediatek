@@ -1805,6 +1805,25 @@ class GetLinkStatsCommand : public WifiCommand {
             ALOGV("LLS %s: invalid num_links=%d", __FUNCTION__, ml_stat->num_links);
             return false;
         }
+
+        // A disconnected STA is allowed to report a valid interface header
+        // with no links.  Do not treat that normal state as a malformed
+        // vendor payload: the framework expects an empty multi-link result
+        // while the interface is idle.  This state check was present before
+        // the dual-ABI parser was added and must remain in the MLO path.
+        if (ml_stat->num_links == 0) {
+            if (ml_stat->info.state >= WIFI_ASSOCIATED) {
+                ALOGE("LLS %s: no links while associated (state=%d)",
+                      __FUNCTION__, ml_stat->info.state);
+                return false;
+            }
+            ALOGV("LLS %s: no links while disconnected (state=%d)",
+                  __FUNCTION__, ml_stat->info.state);
+            num_radios = 0;
+            radio_stats_ptr = nullptr;
+            return true;
+        }
+
         wifi_link_stat* current_link_stat = ml_stat->links;
         for (int i = 0; i < ml_stat->num_links; ++i) {
             const size_t link_header_size = offsetof(wifi_link_stat, peer_info);
